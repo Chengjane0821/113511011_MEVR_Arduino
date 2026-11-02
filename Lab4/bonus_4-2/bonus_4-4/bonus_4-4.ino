@@ -3,8 +3,12 @@
 
 Servo servo;
 
+// ==============================
+// Pin Settings
+// ==============================
 #define trig 2
 #define echo 3
+#define servoPin 5
 
 // ==============================
 // PID Parameters
@@ -16,36 +20,38 @@ double kd = 1.0;
 // ==============================
 // Target Position
 // ==============================
-const float setPoint = 15.0;
+const float setPoint = 8.0;
 
 // ==============================
 // Servo Settings
 // ==============================
-const int baselineAngle = 121;
+const int baselineAngle = 120;
 
-const int minAngle = 115;
-const int maxAngle = 127;
+const int minAngle = 30;
+const int maxAngle = 150;
 
-// 125° 時超音波端升高
-// 因此增加角度 = 遠離超音波
-const int escapeAngle = 127;
+// Larger angle raises sensor end
+// Confirmed direction required
+const int escapeAngle = 130;
 
 // ==============================
 // Safety Settings
 // ==============================
 const float warningDistance = 12.0;
 const float escapeDistance = 9.0;
-
-// 朝超音波移動的速度門檻
 const float warningSpeed = -1.0;
 
 // ==============================
 // Filter Settings
 // ==============================
-const float filterAlpha = 0.4;
+const float filterAlpha = 0.7;
+const float velocityAlpha = 0.5;
 
-// 速度濾波係數
-const float velocityAlpha = 0.3;
+// ==============================
+// Sensor Settings
+// ==============================
+const float minDistance = 2.0;
+const float maxDistance = 35.0;
 
 // ==============================
 // PID Variables
@@ -58,70 +64,63 @@ float filteredVelocity = 0.0;
 
 bool firstReading = true;
 
+// ==============================
+// Timing
+// ==============================
 unsigned long previousTime = 0;
-
+const unsigned long controlInterval = 50;
 
 // ==============================
 // Setup
 // ==============================
 void setup() {
+  Serial.begin(9600);
 
   pinMode(trig, OUTPUT);
   pinMode(echo, INPUT);
+  digitalWrite(trig, LOW);
 
-  servo.attach(5);
-
-  Serial.begin(9600);
-
-  // 啟動時維持水平
+  servo.attach(servoPin);
   servo.write(baselineAngle);
 
   delay(1000);
 
   previousTime = millis();
+
+  Serial.println("Ball-on-Beam Fast PID Started");
 }
-
-
-// ==============================
-// Main Loop
-// ==============================
-void loop() {
-
-  PID();
-
-  delay(50);
-}
-
 
 // ==============================
 // HC-SR04 Distance
 // ==============================
 float distance() {
-
   digitalWrite(trig, LOW);
-  delayMicroseconds(4);
+  delayMicroseconds(2);
 
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
-
   digitalWrite(trig, LOW);
 
   unsigned long t =
-      pulseIn(echo, HIGH, 30000);
+      pulseIn(echo, HIGH, 10000UL);
 
   if (t == 0) {
     return -1.0;
   }
 
-  return t * 0.0343 / 2.0;
-}
+  float d = t * 0.0343 / 2.0;
 
+  if (d < minDistance || d > maxDistance) {
+    return -1.0;
+  }
+
+  return d;
+}
 
 // ==============================
 // PID Control
 // ==============================
 void PID() {
-
   float dis = distance();
 
   unsigned long currentTime = millis();
@@ -131,53 +130,33 @@ void PID() {
 
   previousTime = currentTime;
 
-
-  // ==========================
-  // 1. Sensor Timeout
-  // ==========================
+  // 1. Sensor error
   if (dis < 0) {
-
     servo.write(baselineAngle);
 
     firstReading = true;
     integral = 0.0;
     filteredVelocity = 0.0;
 
-    Serial.println("Sensor timeout");
-
+    Serial.println("Sensor Error");
     return;
   }
 
-  if (dt <= 0.0) {
-    return;
-  }
+  if (dt <= 0.0) return;
 
-
-  // ==========================
-  // 2. Distance Filter
-  // ==========================
+  // 2. Distance filter
   if (firstReading) {
-
     filteredDistance = dis;
     previousDistance = dis;
-
     filteredVelocity = 0.0;
-
     firstReading = false;
-  }
-
-  else {
-
+  } else {
     filteredDistance =
         filterAlpha * dis +
         (1.0 - filterAlpha) * filteredDistance;
   }
 
-
-  // ==========================
-  // 3. Calculate Ball Velocity
-  // ==========================
-
+  // 3. Velocity calculation
   float rawVelocity =
       (filteredDistance - previousDistance) / dt;
 
@@ -187,132 +166,85 @@ void PID() {
 
   previousDistance = filteredDistance;
 
-  // Velocity:
-  // Negative = toward ultrasonic sensor
-  // Positive = away from ultrasonic sensor
-
-
-  // ==========================
-  // 4. Emergency Escape
-  // ==========================
+  // 4. Emergency escape
   if (filteredDistance <= escapeDistance) {
-
     servo.write(escapeAngle);
 
     integral = 0.0;
 
-    Serial.print("EMERGENCY | Distance: ");
+    Serial.print("EMERGENCY | Distance:");
     Serial.print(filteredDistance);
 
-    Serial.print(" | Velocity: ");
-    Serial.println(filteredVelocity);
-
+    Serial.print(" | Servo:");
+    Serial.println(escapeAngle);
     return;
   }
 
+  // 5. PID error
+  double error = setPoint - filteredDistance;
 
-  // ==========================
-  // 5. PID Error
-  // ==========================
-  double error =
-      setPoint - filteredDistance;
-
-
-  // ==========================
-  // 6. P Control
-  // ==========================
+  // 6. Proportional
   double Pvalue = kp * error;
 
-
-  // ==========================
-  // 7. I Control
-  // ==========================
+  // 7. Integral
   integral += error * dt;
-
-  integral = constrain(
-    integral,
-    -20.0,
-    20.0
-  );
+  integral = constrain(integral, -20.0, 20.0);
 
   double Ivalue = ki * integral;
 
+  // 8. Derivative on measurement
+  double Dvalue = -kd * filteredVelocity;
 
-  // ==========================
-  // 8. D Control
-  // ==========================
+  // 9. PID output
+  double PIDvalue = Pvalue + Ivalue + Dvalue;
 
-  // 使用球的速度計算 D
-  // 避免目標變化造成微分突波
-  double Dvalue =
-      -kd * filteredVelocity;
-
-
-  // ==========================
-  // 9. PID Output
-  // ==========================
-  double PIDvalue =
-      Pvalue + Ivalue + Dvalue;
-
-
-  // ==========================
-  // 10. Servo Angle
-  // ==========================
-  int servoAngle =
-      baselineAngle + PIDvalue;
+  // 10. Servo angle
+  int servoAngle = baselineAngle + PIDvalue;
 
   servoAngle = constrain(
-    servoAngle,
-    minAngle,
-    maxAngle
+      servoAngle,
+      minAngle,
+      maxAngle
   );
 
-
-  // ==========================
-  // 11. Early Braking
-  // ==========================
+  // 11. Early braking
   if (
     filteredDistance <= warningDistance &&
     filteredVelocity < warningSpeed
   ) {
-
-    // 球朝超音波快速移動
-    // 提前抬高超音波端
-    servoAngle = max(servoAngle, 125);
-
-    Serial.print("EARLY BRAKE | ");
+    servoAngle = max(servoAngle, 115);
   }
 
-
-  // ==========================
-  // 12. Servo Output
-  // ==========================
+  // 12. Servo output
   servo.write(servoAngle);
 
-
-  // ==========================
   // 13. Serial Monitor
-  // ==========================
-  Serial.print("Distance: ");
-  Serial.print(filteredDistance);
+  Serial.print("Distance:");
+  Serial.print(filteredDistance, 2);
 
-  Serial.print(" cm");
+  Serial.print(",Target:");
+  Serial.print(setPoint, 2);
 
-  Serial.print(" | Target: ");
-  Serial.print(setPoint);
+  Serial.print(",Velocity:");
+  Serial.print(filteredVelocity, 2);
 
-  Serial.print(" | Velocity: ");
-  Serial.print(filteredVelocity);
+  Serial.print(",Error:");
+  Serial.print(error, 2);
 
-  Serial.print(" | Error: ");
-  Serial.print(error);
-
-  Serial.print(" | P: ");
-  Serial.print(Pvalue);
-
-  Serial.print(" | D: ");
-  Serial.print(Dvalue);
-
-  Serial.print(" | Servo: ");
+  Serial.print(",Servo:");
   Serial.println(servoAngle);
+}
+
+// ==============================
+// Main Loop
+// ==============================
+void loop() {
+  static unsigned long lastControl = 0;
+
+  unsigned long now = millis();
+
+  if (now - lastControl >= controlInterval) {
+    lastControl = now;
+    PID();
+  }
 }
